@@ -32,7 +32,11 @@ if sys.version_info[0] == 2:
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
-logger.setLevel(logging.INFO)
+
+if os.environ.get('CF_DEBUG'):
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
 
 try:
     CF_HEADERS = {
@@ -52,7 +56,6 @@ except KeyError:
 
 
 def _has_dns_propagated(name, token):
-    txt_records = []
     try:
         if dns_servers:
             custom_resolver = dns.resolver.Resolver()
@@ -60,17 +63,13 @@ def _has_dns_propagated(name, token):
             dns_response = custom_resolver.query(name, 'TXT')
         else:
             dns_response = dns.resolver.query(name, 'TXT')
+            
         for rdata in dns_response:
-            for txt_record in rdata.strings:
-                txt_records.append(txt_record.decode('utf-8'))
-    except dns.exception.DNSException:
-        return False
-
-    for txt_record in txt_records:
-        if txt_record == token:
-            return True
-
-    return False
+            if token in [b.decode('utf-8') for b in rdata.strings]:
+                return True
+                
+    except dns.exception.DNSException as e:
+        logger.debug(" + {0}. Retrying query...".format(e))
 
 
 # https://api.cloudflare.com/#zone-list-zones
@@ -90,7 +89,7 @@ def _get_txt_record_id(zone_id, name, token):
     try:
         record_id = r.json()['result'][0]['id']
     except IndexError:
-        logger.info(" + Unable to locate record named {0}".format(name))
+        logger.debug(" + Unable to locate record named {0}".format(name))
         return
 
     return record_id
@@ -98,8 +97,9 @@ def _get_txt_record_id(zone_id, name, token):
 
 # https://api.cloudflare.com/#dns-records-for-a-zone-create-dns-record
 def create_txt_record(args):
-    domain, token = args[0], args[2]
-    logger.debug(' + Creating TXT record: {} => {}'.format(domain, token))
+    domain, challenge, token = args
+    logger.debug(' + Creating TXT record: {0} => {1}'.format(domain, token))
+    logger.debug(' + Challenge: {0}'.format(challenge))
     zone_id = _get_zone_id(domain)
     name = "{0}.{1}".format('_acme-challenge', domain)
     
@@ -118,7 +118,7 @@ def create_txt_record(args):
     r = requests.post(url, headers=CF_HEADERS, json=payload)
     r.raise_for_status()
     record_id = r.json()['result']['id']
-    logger.debug("+ TXT record created, ID: {0}".format(record_id))
+    logger.debug(" + TXT record created, CFID: {0}".format(record_id))
 
 
 # https://api.cloudflare.com/#dns-records-for-a-zone-delete-dns-record
@@ -132,20 +132,30 @@ def delete_txt_record(args):
     name = "{0}.{1}".format('_acme-challenge', domain)
     record_id = _get_txt_record_id(zone_id, name, token)
 
-    logger.debug(" + Deleting TXT record name: {0}".format(name))
-    url = "https://api.cloudflare.com/client/v4/zones/{0}/dns_records/{1}".format(zone_id, record_id)
-    r = requests.delete(url, headers=CF_HEADERS)
-    r.raise_for_status()
+    if record_id:
+        url = "https://api.cloudflare.com/client/v4/zones/{0}/dns_records/{1}".format(zone_id, record_id)
+        r = requests.delete(url, headers=CF_HEADERS)
+        r.raise_for_status()
+        logger.debug(" + Deleted TXT {0}, CFID {1}".format(name, record_id))
+    else:
+        logger.debug(" + No TXT {0} with token {1}".format(name, token))
 
 
 def deploy_cert(args):
     domain, privkey_pem, cert_pem, fullchain_pem, chain_pem, timestamp = args
-    logger.info(' + ssl_certificate: {0}'.format(fullchain_pem))
-    logger.info(' + ssl_certificate_key: {0}'.format(privkey_pem))
+    logger.debug(' + ssl_certificate: {0}'.format(fullchain_pem))
+    logger.debug(' + ssl_certificate_key: {0}'.format(privkey_pem))
     return
 
 
 def unchanged_cert(args):
+    return
+    
+
+def invalid_challenge(args):
+    domain, result = args
+    logger.debug(' + invalid_challenge for {0}'.format(domain))
+    logger.debug(' + Full error: {0}'.format(result))
     return
 
 
@@ -163,10 +173,12 @@ def create_all_txt_records(args):
             logger.info(" + DNS not propagated, waiting 30s...")
             time.sleep(30)
 
+
 def delete_all_txt_records(args):
     X = 3
     for i in range(0, len(args), X):
         delete_txt_record(args[i:i+X])
+
 
 def main(argv):
     ops = {
@@ -174,6 +186,7 @@ def main(argv):
         'clean_challenge' : delete_all_txt_records,
         'deploy_cert'     : deploy_cert,
         'unchanged_cert'  : unchanged_cert,
+        'invalid_challenge': invalid_challenge,
     }
     logger.info(" + CloudFlare hook executing: {0}".format(argv[0]))
     ops[argv[0]](argv[1:])
